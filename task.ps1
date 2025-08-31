@@ -43,12 +43,46 @@ if (-not $webNsg)
     $webHttpRule = New-AzNetworkSecurityRuleConfig -Name "web" -Description "Allow HTTP" `
        -Access Allow -Protocol Tcp -Direction Inbound -Priority 100 -SourceAddressPrefix `
        Internet -SourcePortRange * -DestinationAddressPrefix * -DestinationPortRange 80,443
+
+    $webAppRule = New-AzNetworkSecurityRuleConfig -Name "webapp" -Description "Allow app traffic from Load Balancer" `
+       -Access Allow -Protocol Tcp -Direction Inbound -Priority 110 -SourceAddressPrefix `
+       AzureLoadBalancer -SourcePortRange * -DestinationAddressPrefix * -DestinationPortRange 8080
+
     $webNsg = New-AzNetworkSecurityGroup -ResourceGroupName $resourceGroupName -Location $location -Name `
-       $webSubnetName -SecurityRules $webHttpRule
+       $webSubnetName -SecurityRules $webHttpRule,$webAppRule
 }
 else
 {
-    Write-Host "Web network security group already exists, using existing one."
+    Write-Host "Web network security group already exists, checking for port 8080 rule..."
+
+    $lbRule = $webNsg.SecurityRules | Where-Object { $_.Name -eq "webapp" }
+    if (-not $lbRule) {
+        Write-Host "Adding port 8080 rule for Load Balancer traffic..."
+        $webNsg | Add-AzNetworkSecurityRuleConfig -Name "webapp" -Description "Allow app traffic from Load Balancer" `
+           -Access Allow -Protocol Tcp -Direction Inbound -Priority 110 -SourceAddressPrefix `
+           AzureLoadBalancer -SourcePortRange * -DestinationAddressPrefix * -DestinationPortRange 8080
+
+        $webNsg | Set-AzNetworkSecurityGroup
+    } else {
+        $needsUpdate = $false
+        if ($lbRule.SourceAddressPrefix -ne "AzureLoadBalancer" -or
+            $lbRule.DestinationPortRange -ne "8080" -or
+            $lbRule.Protocol -ne "Tcp" -or
+            $lbRule.Access -ne "Allow") {
+            $needsUpdate = $true
+        }
+
+        if ($needsUpdate) {
+            Write-Host "Updating existing port 8080 rule for Load Balancer traffic..."
+            $webNsg | Set-AzNetworkSecurityRuleConfig -Name "webapp" -Description "Allow app traffic from Load Balancer" `
+               -Access Allow -Protocol Tcp -Direction Inbound -Priority 110 -SourceAddressPrefix `
+               AzureLoadBalancer -SourcePortRange * -DestinationAddressPrefix * -DestinationPortRange 8080
+
+            $webNsg | Set-AzNetworkSecurityGroup
+        } else {
+            Write-Host "Port 8080 rule for Load Balancer already exists and is correctly configured."
+        }
+    }
 }
 
 Write-Host "Checking if management network security group exists..."
@@ -199,16 +233,27 @@ else
 
 Write-Host "Checking if DNS A record exists..."
 $existingRecord = Get-AzPrivateDnsRecordSet -ResourceGroupName $resourceGroupName -ZoneName $privateDnsZoneName -Name "todo" -RecordType A -ErrorAction SilentlyContinue
-if (-not $existingRecord)
-{
+if (-not $existingRecord) {
     Write-Host "Creating an A DNS record ..."
     $Records = @()
     $Records += New-AzPrivateDnsRecordConfig -IPv4Address $lbIpAddress
     New-AzPrivateDnsRecordSet -Name "todo" -RecordType A -ResourceGroupName $resourceGroupName -TTL 1800 -ZoneName $privateDnsZoneName -PrivateDnsRecords $Records
-}
-else
-{
-    Write-Host "DNS A record already exists, using existing one."
+} else {
+    $currentIpAddresses = $existingRecord.Records | ForEach-Object { $_.Ipv4Address }
+    $needsUpdate = $false
+
+    if ($currentIpAddresses.Count -ne 1 -or $currentIpAddresses[0] -ne $lbIpAddress) {
+        $needsUpdate = $true
+    }
+
+    if ($needsUpdate) {
+        Write-Host "DNS A record exists but points to different IP(s). Updating to point to $lbIpAddress ..."
+        $existingRecord.Records.Clear()
+        $existingRecord.Records.Add((New-AzPrivateDnsRecordConfig -IPv4Address $lbIpAddress))
+        Set-AzPrivateDnsRecordSet -RecordSet $existingRecord
+    } else {
+        Write-Host "DNS A record already exists and points to the correct IP address."
+    }
 }
 
 Write-Host "Checking if load balancer exists..."
